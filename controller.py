@@ -167,7 +167,6 @@ class Controller(Thread):
         self.ip_for_mac = {}
         self.port_for_mac = {}
         self.routes = {}
-        self.arp_times = []
         self.PWOSPFInterfaces = []
         self.PWOSPFHellos = []
         self.swIP = []
@@ -226,7 +225,6 @@ class Controller(Thread):
                 action_name='MyIngress.arp_match',
                 action_params={'dstAddr': mac})
         self.ip_for_mac[ip] = mac
-        #self.arp_times[ip] = time.time()
     #
     # *** Layer 3 ***
     #
