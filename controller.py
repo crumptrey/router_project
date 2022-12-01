@@ -13,6 +13,8 @@ TYPE_CPU_METADATA = 0x080a
 TYPE_IPV4 = 0x0800
 TYPE_ARP = 0x0806
 
+OSPF_LEN = 24
+
 ARP_OP_REQ   = 0x0001
 ARP_OP_REPLY = 0x0002
 
@@ -32,7 +34,7 @@ CPU_PORT = 0x1
 '''
 PWOSPF/ARP Timing:
 
-We need a few different threads for timing/nonsequential operations (i.e. periodically sending packets)
+We need a few different threads for timing/nonsequential operations (i.e.  sending packets)
 
 1) PWOSPF_HELLO
 Thread that deals with periodically sending HELLO packets on each of our interfaces
@@ -50,55 +52,62 @@ class PWOSPFInterface():
         self.helloint = helloint
         self.routerID = self.controller.routerID
         self.neighbor = []
+        self.neighbor_times = {}
         self.subnet, self.mask, self.prefixLen = self.controller.infoIP(self.port) 
-        self.initializeNeighbors()
 
-    def initializeNeighbors(self):
-        for self.port, _ in self.controller.sw.intfs.items():
-            if self.port > 1: # avoids controller
-                self.addNeighbor(self.port, '0.0.0.0')
-                subnet, mask, prefixLen = self.controller.infoIP(self.port)
-                self.controller.addRoute(subnet, prefixLen, self.port, '0.0.0.0')
+    def addNeighbor(self, neighborID, neighborIP):
+        self.neighbor.append((neighborID, neighborIP))
+        self.timeNeighbor(neighborID,neighborIP)
+        print('Added neighbor')
 
-    def addNeighbor(self, port, routerID):
-        self.neighbor.append((routerID, port))
+    def removeNeighbor(self, neighborID, neighborIP):
+        self.neighbor.remove((neighborID, neighborIP)) # removing neighbor
+        self.neighbor_times.pop((neighborID, neighborIP)) # need to also remove the neighbor's times 
+        print('Removed neighbor')
 
-    def removeNeighbor(self, port, routerID):
-        self.neighbor.remove((routerID, port))
-    
-    def existentNeighbor(self, port, routerID):
-        return (routerID, port) in self.neighbors
+    def knownNeighbor(self, neighborID, neighborIP):
+        return (neighborID, neighborIP) in self.neighbor
+
+    def timeNeighbor(self, neighborID, neighborIP):
+        self.neighbor_times[(neighborID, neighborIP)] = 0 
+
+    def addtimeNeighbor(self, neighborID, neighborIP, time):
+        self.neighbor_times[(neighborID, neighborIP)] = time
 
 class PWOSPFHello(Thread):
-    def __init__(self, controller, interface):
+    def __init__(self, controller, interface, port, pwospf_interface):
         super(PWOSPFHello, self).__init__()
         self.controller = controller
         self.intf = interface
+        self.intf_port = port
+        self.pwintf = pwospf_interface
+        self.neighbor_timeout = self.controller.helloint * 3
 
     def run(self):
-        for i in range(len(self.controller.sw.intfs)):
-            if self.intf.port > 1:
-                helloPkt = Ether()/CPUMetadata()/IP()/PWOSPF()/HELLO()
+        if self.intf_port > 1:
+            helloPkt = Ether()/CPUMetadata()/IP()/PWOSPF()/HELLO()
                 # Ether
-                helloPkt[Ether].src = self.controller.MAC
-                helloPkt[Ether].dst = MAC_BROADCAST
-                helloPkt[Ether].type = TYPE_CPU_METADATA  
+            helloPkt[Ether].src = self.controller.MAC
+            helloPkt[Ether].dst = MAC_BROADCAST
                 #IP
-                helloPkt[CPUMetadata].origEtherType = TYPE_IPV4
-                helloPkt[CPUMetadata].dstPort = self.intf.port
-                helloPkt[IP].src = self.controller.swIP[self.intf.port]
-                helloPkt[IP].dst = ALLSPFRouters_dstAddr
-                helloPkt[IP].proto = PWOSPF_PROTO
+            helloPkt[CPUMetadata].origEtherType = TYPE_IPV4
+            helloPkt[CPUMetadata].dstPort = self.intf_port
+            helloPkt[CPUMetadata].srcPort = CPU_PORT
+            helloPkt[IP].src = self.intf.ip
+            helloPkt[IP].dst = ALLSPFRouters_dstAddr
+            helloPkt[IP].proto = PWOSPF_PROTO
                 # PWOSPF
-                helloPkt[PWOSPF].version = PWOSPF_VERSION
-                helloPkt[PWOSPF].type = TYPE_HELLO
-                helloPkt[PWOSPF].routerID = 1
-                helloPkt[PWOSPF].areaID = self.controller.areaID
-                helloPkt[PWOSPF].checksum = 0
-                helloPkt[HELLO].mask = ((0xffffffff >> (32 - self.intf.prefixLen)) << (32 - self.intf.prefixLen))
-                helloPkt[HELLO].helloint = self.controller.helloint
-            
-                self.controller.send(helloPkt)
+            helloPkt[PWOSPF].length = OSPF_LEN
+            helloPkt[PWOSPF].version = PWOSPF_VERSION
+            helloPkt[PWOSPF].type = TYPE_HELLO
+            helloPkt[PWOSPF].routerID = self.controller.routerID
+            helloPkt[PWOSPF].areaID = self.controller.areaID
+            helloPkt[PWOSPF].checksum = 0
+            helloPkt[HELLO].mask = ((0xffffffff >> (32 - int(self.intf.prefixLen))) << (32 - int(self.intf.prefixLen)))
+                
+            helloPkt[HELLO].helloint = self.controller.helloint
+            self.controller.send(helloPkt)
+            # Checking up on the neighbors
 
         time.sleep(self.controller.helloint)
 
@@ -107,8 +116,44 @@ class PWOSPFLSU(Thread):
         super(PWOSPFLSU, self).__init__()
         self.controller = controller
 
+    def run(self):
+        lsuPkt = Ether()/CPUMetadata()/IP()/PWOSPF()/LSU()/LSUadv()
+            # Ether
+        lsuPkt[Ether].src = self.controller.MAC
+        lsuPkt[Ether].dst = MAC_BROADCAST
+            # CPUMetadata
+        lsuPkt[CPUMetadata].origEtherType = TYPE_IPV4
+        lsuPkt[CPUMetadata].srcPort = CPU_PORT
+            # IP
+        lsuPkt[IP].proto = PWOSPF_PROTO
+        lsuPkt[IP].src = self.controller.routerID
+            # PWOSPF
+        lsuPkt[PWOSPF].length = OSPF_LEN
+        lsuPkt[PWOSPF].version = PWOSPF_VERSION
+        lsuPkt[PWOSPF].type = TYPE_LSU
+        lsuPkt[PWOSPF].routerID = self.controller.routerID
+        lsuPkt[PWOSPF].areaID = self.controller.areaID
+        lsuPkt[PWOSPF].checksum = 0
+        ads = []
+        for interface in self.controller.PWOSPFInterfaces:
+            for neighbor in interface.neighbor:
+                ad = LSUadv()
+                ad[LSUadv].subnet = interface.subnet
+                ad[LSUadv].mask = interface.mask
+                ad[LSUadv].routerID = neighbor[0]
+                ads.append(ad)
+        lsuPkt[LSU].sequence = self.controller.lsu_seq
+        lsuPkt[LSU].ttl = 32
+        lsuPkt[LSU].numAdvs = len(ads)
+        lsuPkt[LSU].Advs = ads
+
+        self.controller.LSUFlood(lsuPkt)
+        lsuPkt[LSU].sequence = lsuPkt[LSU].sequence + 1
+            
+        time.sleep(self.controller.lsu_int) 
+
 class Controller(Thread):
-    def __init__(self, sw, routerID, MAC, areaID = 1, helloint = 30, lsu_int = 3, lsu_seq = 0, start_wait=0.3):
+    def __init__(self, sw, routerID, MAC, areaID = 1, helloint = 15, lsu_int = 5, lsu_seq = 0, start_wait=0.3):
         super(Controller, self).__init__()
         self.sw = sw
         self.start_wait = start_wait # time to wait for the controller
@@ -127,12 +172,13 @@ class Controller(Thread):
         self.PWOSPFHellos = []
         self.swIP = []
         self.lsu_seq = lsu_seq
+        self.lsu_int = lsu_int
         for i in range(len(sw.intfs)):
             self.PWOSPFInterfaces.append(PWOSPFInterface(controller = self, port = i, helloint = self.helloint))
-            self.PWOSPFHellos.append(PWOSPFHello(controller=self, interface=self.PWOSPFInterfaces[i]))
+            self.PWOSPFHellos.append(PWOSPFHello(controller=self, interface=self.sw.intfs[i],port = i, pwospf_interface = PWOSPFInterface(controller = self, port = i, helloint = self.helloint)))
             self.swIP.append(self.sw.intfs[i].ip)
+        self.PWOSPFLSU = PWOSPFLSU(controller = self) 
         self.defaultTables()
-        self.flag = 0
         self.stop_event = Event()
     # 
     # *** Basic Functions ***
@@ -149,6 +195,7 @@ class Controller(Thread):
         return maskedIP
     
     def defaultTables(self):
+        self.addIPAddr(ALLSPFRouters_dstAddr, MAC_BROADCAST)
         for i in range(len(self.sw.intfs)):
             if i > 0:
                 self.addIPAddr(self.sw.intfs[i].ip,self.sw.intfs[i].mac)
@@ -201,7 +248,15 @@ class Controller(Thread):
         return 0
             
         
-                        
+    def LSUFlood(self, pkt):
+        for interface in self.PWOSPFInterfaces:
+            for neighbor in interface.neighbor:
+                pkt2 = pkt
+                pkt2[CPUMetadata].dstPort = interface.port
+                pkt2[IP].dst = neighbor[0]
+                self.send(pkt2)
+                print('FLooding')
+                     
     # 
     # *** ARP Functionality ***
     # * generateArpRequest: function is applied when next hop pkt[Ether].dst is not in the ARP table
@@ -222,7 +277,6 @@ class Controller(Thread):
         pkt[ARP].hwsrc = self.sw.intfs[port].mac
         pkt[ARP].psrc = self.sw.intfs[port].ip
         pkt[ARP].hwdst = MAC_BROADCAST
-        pkt.show2()
         self.send(pkt)
 
     def handleArpReply(self, pkt):
@@ -294,14 +348,49 @@ class Controller(Thread):
         if pkt[CPUMetadata].fromCpu == 1: return
 
         if ARP in pkt:
+            print('ARP in pkt')
             self.addMacAddr(pkt[ARP].hwsrc, pkt[CPUMetadata].srcPort)
             self.addIPAddr(pkt[ARP].psrc, pkt[ARP].hwsrc)
             if pkt[ARP].op == ARP_OP_REQ:
+                print('ARP Request Received')
                 self.handleArpRequest(pkt)
             elif pkt[ARP].op == ARP_OP_REPLY:
+                print('ARP Reply Received')
                 self.handleArpReply(pkt)
 
         if IP in pkt:
+
+            if ICMP in pkt:
+                # Responding to ICMP ECHO requests
+                print('ICMP in pkt')
+                if pkt[ICMP].type == ICMP_ECHO_REQUEST and pkt[ICMP].code == ICMP_ECHO_CODE:
+                    self.icmpEcho(pkt)
+
+            if PWOSPF in pkt:
+                print('PWOSPF in pkt')
+                if pkt[PWOSPF].version != PWOSPF_VERSION: return
+                if pkt[PWOSPF].areaID != self.areaID: return
+                if HELLO in pkt:
+                    print('HELLO in pkt')
+                    interface = self.PWOSPFInterfaces[pkt[CPUMetadata].srcPort]
+                    # Check values of Network Mask and HelloInt fields
+                    # Source is identified by the source address found in the Hello's IP header
+                    # We can now check/update the neighbor relationships
+                    if (pkt[HELLO].mask == interface.mask) and (pkt[HELLO].helloint == interface.helloint):
+                        if interface.knownNeighbor(pkt[PWOSPF].routerID, pkt[IP].src):
+                            print('Updated neighbor')
+                            interface.addtimeNeighbor(pkt[PWOSPF].routerID, pkt[IP].src, time.time())
+                        else:
+                            print('Added neighbor')
+                            interface.addNeighbor(pkt[PWOSPF].routerID, pkt[IP].src)
+                    
+                    else: return
+                    print(interface.neighbor)
+
+                if LSU in pkt:
+                    
+                    print('LSU in pkt')
+                    
 
             port = self.searchRoutes(pkt[IP].dst)
             print(pkt[IP].dst)
@@ -312,16 +401,7 @@ class Controller(Thread):
                 self.generateArpRequest(pkt[IP].dst, port)
 
             
-            if ICMP in pkt:
-                #pkt.show2()
-                # Responding to ICMP ECHO requests
-                if pkt[ICMP].type == ICMP_ECHO_REQUEST and pkt[ICMP].code == ICMP_ECHO_CODE:
-                    self.icmpEcho(pkt)
-
-            if PWOSPF in pkt:
-                if pkt[PWOSPF].version != PWOSPF_VERSION: return
-                if pkt[PWOSPF].routerID == self.routerID: return
-                if pkt[PWOSPF].areaID != self.areaID: return
+                        
 
 
 
@@ -331,7 +411,6 @@ class Controller(Thread):
         pkt[CPUMetadata].fromCpu = 1
         kwargs = dict(iface=self.iface, verbose=False)
         kwargs.update(override_kwargs)
-        pkt.show2()
         sendp(pkt, *args, **kwargs)
 
     def run(self):
@@ -339,8 +418,9 @@ class Controller(Thread):
 
     def start(self, *args, **kwargs):
         super(Controller, self).start(*args, **kwargs)
-#        for i in self.PWOSPFHellos:
-#            i.start()
+        for i in self.PWOSPFHellos:
+            i.start()
+        self.PWOSPFLSU.start()
         time.sleep(self.start_wait)
 
     def join(self, *args, **kwargs):

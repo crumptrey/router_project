@@ -210,7 +210,6 @@ control MyIngress(inout headers hdr,
         }
         size = 1024;
         // packets for which no matching entry is found in the routing table should be send to software
-        default_action = send_to_cpu();
     }
 
     // Provide a "local IP address table". This will accept an IP address as a search key and will return a signal that indicates whether the corresponding address was found. This table is used to identify IP addresses that should be forwarded to the CPU
@@ -224,6 +223,7 @@ control MyIngress(inout headers hdr,
         }
         size = 64;
     }
+
 
     apply {
         if (standard_metadata.ingress_port == CPU_PORT) {
