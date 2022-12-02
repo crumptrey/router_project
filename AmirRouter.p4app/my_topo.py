@@ -7,6 +7,13 @@ class DemoTopo(Topo):
         # Initialize topology and default options
         Topo.__init__(self, **opts)
 
+        # Topology:
+        #                                    -----s3 --- h4
+        #                                   |     |
+        #                              h1 --- s1 --- s2 --- h2
+        #                                   |
+        #                                  h3
+        
         # Creating Routers
         s1 = self.addSwitch('s1')
         s2 = self.addSwitch('s2')
@@ -26,12 +33,7 @@ class DemoTopo(Topo):
         h3 = self.addHost('h3', ip="10.0.3.10/24", mac='00:00:00:00:00:13')
         h4 = self.addHost('h4', ip="10.0.4.10/24", mac='00:00:00:00:00:14')
 
-
-        #                                    -----s3 --- h4
-        #                                   |     |
-        # Connecting nodes:         h1 --- s1 --- s2 --- h2
-        #                                   |
-        #                                  h3
+        # Adding links
         self.addLink(h1, s1)
         self.addLink(s1, s2)
         self.addLink(s2, h2)
@@ -50,6 +52,7 @@ class DemoTopo(Topo):
         h3 = net.get('h3')
         h4 = net.get('h4')
         
+        # Assigning IP and MAC addresses
         s1.setIP('10.1.1.1/24', intf = 's1-eth1') # s1-c1
         s1.setMAC('00:00:00:00:01:01', intf = 's1-eth1')
         s1.setIP('10.0.1.1/24', intf = 's1-eth2') # s1-h1
@@ -79,7 +82,7 @@ class DemoTopo(Topo):
         s3.setIP('10.0.4.1/24', intf = 's3-eth4') # s3-h4
         s3.setMAC('00:00:00:00:03:04', intf='s3-eth4')
 
-        # h1.setDefaultRoute("dev eth0 via 10.0.1.1")
+        # Set default routes:
         h1.setDefaultRoute("dev eth0 via 10.0.1.1")
         h2.setDefaultRoute("dev eth0 via 10.0.2.1")
         h3.setDefaultRoute("dev eth0 via 10.0.3.1")
