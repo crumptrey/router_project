@@ -117,6 +117,24 @@ parser MyParser(packet_in packet,
 
 control MyVerifyChecksum(inout headers hdr, inout metadata meta) {
     apply {
+      verify_checksum(
+          hdr.ipv4.isValid(),
+          {
+            hdr.ipv4.version,
+            hdr.ipv4.ihl,
+            hdr.ipv4.diffserv,
+            hdr.ipv4.totalLen,
+            hdr.ipv4.identification,
+            hdr.ipv4.flags,
+            hdr.ipv4.fragOffset,
+            hdr.ipv4.ttl,
+            hdr.ipv4.protocol,
+            hdr.ipv4.srcAddr,
+            hdr.ipv4.dstAddr
+          },
+          hdr.ipv4.hdrChecksum,
+          HashAlgorithm.csum16
+        );
     }
 }
 
@@ -239,7 +257,7 @@ control MyIngress(inout headers hdr,
             send_to_cpu();
         }
 
-        else if (hdr.ipv4.isValid()){
+        else if (hdr.ipv4.isValid() && standard_metadata.checksum_error == 0){
             ip_packets.count((bit<32>) 1);
             // Verify that the TTL is valid 
             if (hdr.ipv4.ttl == 0) {
@@ -258,6 +276,9 @@ control MyIngress(inout headers hdr,
                 hdr.ipv4.ttl = hdr.ipv4.ttl - 1;
                 if (hdr.ipv4.protocol == PWOSPF_PROTO){
                     pwospf_packets.count((bit<32>) 1);
+                    if (standard_metadata.ingress_port != CPU_PORT) { // needed a way for received hello packets to get processed by controller
+                        send_to_cpu();
+                    }
                 }
                 if (hdr.ipv4.protocol == ICMP_PROTO) {
                     icmp_packets.count((bit<32>) 1);
