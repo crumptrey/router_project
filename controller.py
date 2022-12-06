@@ -1,4 +1,4 @@
-from threading import Thread, Event
+from threading import Thread, Event, Lock
 from scapy.all import sendp
 from scapy.all import get_if_addr
 from scapy.all import Packet, Ether, IP, ARP, ICMP, Raw
@@ -29,7 +29,8 @@ ICMP_HOST_UNREACHABLE = 0x03
 ICMP_HOST_UNREACHABLE_CODE = 0x01
 
 MAC_BROADCAST = "ff:ff:ff:ff:ff:ff"
-
+HOST_ID = '0.0.0.0'
+ROUTER_MASK = '255.255.255.255'
 PWOSPF_VERSION = 2
 CPU_PORT = 0x1
 
@@ -151,14 +152,13 @@ class PWOSPFLSU(Thread):
                         for neighbor in interface.neighbor:
                             ad[LSUadv].routerID = neighbor[0] # neighbor routerID
                     else:
-                        ad[LSUadv].routerID = '0.0.0.0'
+                        ad[LSUadv].routerID = HOST_ID
                     ads.append(ad)
             lsuPkt[LSU].sequence = self.controller.lsu_seq
             lsuPkt[LSU].ttl = 32
             lsuPkt[LSU].numAdvs = len(ads)
             lsuPkt[LSU].Advs = ads
             lsuPkt[LSU].sequence += 1
-            print(ads)
             self.controller.LSUFlood(lsuPkt)
             del ads
             time.sleep(self.controller.lsu_int) 
@@ -176,15 +176,22 @@ class Controller(Thread):
         self.helloint = helloint
         # ARP/PWOSPF stuff
         self.ip_for_mac = {}
+        self.routingLock = Lock()
+        self.arpLock = Lock()
+        self.pendingLock = Lock()
         self.port_for_mac = {}
+        self.swIP = []
         self.defaultTables()
         self.routes = {}
+        self.helloIPs = {}
         self.PWOSPFInterfaces = []
+        self.pendingPacket = []
         self.PWOSPFHellos = []
-        self.swIP = []
         self.lsu_data = dict()
         self.lsu_seq = lsu_seq
         self.lsu_int = lsu_int
+        self.timeout = 5
+        self.topo = nx.Graph()
         for i in range(len(sw.intfs)):
             self.PWOSPFInterfaces.append(PWOSPFInterface(controller = self, port = i, helloint = self.helloint))
             self.PWOSPFHellos.append(PWOSPFHello(controller=self, interface=self.sw.intfs[i],port = i, pwospf_interface = PWOSPFInterface(controller = self, port = i, helloint = self.helloint)))
@@ -204,14 +211,25 @@ class Controller(Thread):
         shift = 32 - prefixLen
         maskedIP = str(ipaddress.ip_address((int(ipaddress.ip_address(ip)) >> shift) << shift))
         return maskedIP
-    
+
+    def maskToPrefix(self, mask):
+        m = int(ipaddress.ip_address(mask))
+        i = 0
+        while m % 2 == 0:
+            m /= 2
+            i += 1
+        return 32 - i
+
     def defaultTables(self):
+        for ip in self.swIP:
+            self.sw.insertTableEntry(table_name='MyIngress.local_routing',
+                    match_fields={'hdr.ipv4.dstAddr': [ip]},
+                    action_name='send_to_cpu')
         self.addIPAddr(ALLSPFRouters_dstAddr, MAC_BROADCAST)
         for i in range(len(self.sw.intfs)):
             if i > 0:
                 self.addIPAddr(self.sw.intfs[i].ip,self.sw.intfs[i].mac)
         #print('Default ARP Entries:')
-        print(self.ip_for_mac)
         for port, intf in self.sw.intfs.items():
             if intf.mac and port > 1:
                 self.sw.insertTableEntry(table_name='MyEgress.mac_rewrite',
@@ -240,23 +258,33 @@ class Controller(Thread):
         self.ip_for_mac[ip] = mac
     #
     # *** Layer 3 ***
-    #
+    #   
+    def delAllRoutingEntries(self):
+        with self.routingLock:
+            for item in self.routes:
+                _, _, entry = self.routes[item]
+                self.sw.removeTableEntry(entry)
+            self.routes.clear()
+
     def addRoute(self, subnet, prefixLen, port, ipv4_next_hop):
         if (subnet, prefixLen) in self.routes: return
-        entry = {'table_name': 'MyIngress.routing_table',
-                'match_fields':{'hdr.ipv4.dstAddr': [subnet, prefixLen]},
-                'action_name':'MyIngress.ipv4_match',
-                'action_params':{'port': [port], 'dstAddr':[ipv4_next_hop]}}
+        with self.routingLock:
+            entry = {'table_name': 'MyIngress.routing_table',
+                    'match_fields':{'hdr.ipv4.dstAddr': [subnet, prefixLen]},
+                    'action_name':'MyIngress.ipv4_match',
+                    'action_params':{'port': [port], 'dstAddr':[ipv4_next_hop]}}
 
-        self.sw.insertTableEntry(entry=entry)
-        self.routes[(subnet, prefixLen)] = (port, ipv4_next_hop, entry)
+            self.sw.insertTableEntry(entry=entry)
+            self.routes[(subnet, prefixLen)] = (port, ipv4_next_hop, entry)
 
     def searchRoutes(self, ip):
-        for subnet, prefixLen in self.routes.keys():
-            maskedIP = self.ip2masked(ipaddress.ip_address(ip), prefixLen)
-            if maskedIP == subnet:
-                return self.routes[(subnet, prefixLen)][0]
-        return 0
+        port, hop = 0,0
+        with self.routingLock:
+            for subnet, prefixLen in self.routes.keys():
+                maskedIP = self.ip2masked(ipaddress.ip_address(ip), prefixLen)
+                if maskedIP == subnet:
+                    port, hop = self.routes[(subnet, prefixLen)][0],self.routes[(subnet,prefixLen)][1]
+        return port, hop
 
     def LSUFlood(self, pkt):
         if pkt[LSU].ttl > 0:
@@ -269,8 +297,41 @@ class Controller(Thread):
                     if pkt2[IP].dst != pkt2[IP].src:
                         self.send(pkt2)
                         #print('Flooding neighbors')
-                     
-    # 
+
+    def topoUpdate(self, adj_list, sourceID):
+        self.topo.clear()
+        self.delAllRoutingEntries()
+        for neighborID in adj_list:
+            source = (str(ipaddress.ip_address(sourceID)), ROUTER_MASK)
+            destination = (0,0)
+
+            if neighborID == HOST_ID: # if node is a host
+                destination = (adj_list[neighborID]['subnet'], adj_list[neighborID]['mask'])
+            else: # node is a neighboring router
+                destination = (str(ipaddress.ip_address(adj_list[neighborID]['routerID'])), ROUTER_MASK)
+            self.topo.add_edge(source, destination)
+
+    def addShortestPaths(self):
+        source = (str(ipaddress.ip_address(self.routerID)), ROUTER_MASK)
+        paths = nx.shortest_path(self.topo, source = source)
+        for port, _ in self.sw.intfs.items():
+            if port > 1:
+                subnet, mask, prefixLen = self.infoIP(port)
+                self.addRoute(subnet, prefixLen, port, HOST_ID) # re-adds our host routes
+
+        for destination in paths:
+            if len(paths[destination]) == 1: continue
+            nhop = paths[destination][1]
+            if nhop[1] == ROUTER_MASK:
+                subnet, mask = destination
+                prefixLen = self.maskToPrefix(mask)
+                nhop_routerID = nhop[0]
+                if nhop_routerID in self.helloIPs:
+                    nhop_ip = self.helloIPs[nhop_routerID]['hop']
+                    nhop_port = self.helloIPs[nhop_routerID]['port']
+                    self.addRoute(subnet, prefixLen, nhop_port, nhop_ip)
+
+
     # *** ARP Functionality ***
     # * generateArpRequest: function is applied when next hop pkt[Ether].dst is not in the ARP table
     # * handleArpReply: function is applied when ARP has request in it
@@ -293,7 +354,17 @@ class Controller(Thread):
         self.send(pkt)
 
     def handleArpReply(self, pkt):
-        self.send(pkt)
+        if pkt[ARP].pdst in self.swIP:
+            to_remove = []
+            with self.pendingLock:
+                for packet in self.packetPending:
+                    nhop = packet[2]
+                    if nhop in self.ip_for_mac:
+                        to_remove.append(packet)
+                for packet in to_remove:
+                    self.pendingPacket.remove(packet)
+            for packet in to_remove:
+                self.send(packet[0])
 
     def handleArpRequest(self, pkt):
         # Destination IP address
@@ -315,45 +386,49 @@ class Controller(Thread):
             self.send(pkt)
 
     def icmpEcho(self, pkt):
-        # Ether
-        srcEth = pkt[Ether].src
-        pkt[Ether].src = self.sw.intfs[pkt[CPUMetadata].srcPort].mac
-        pkt[Ether].dst = srcEth
-        # CPU Meta
-        pkt[CPUMetadata].fromCpu = 1
-        pkt[CPUMetadata].dstPort = pkt[CPUMetadata].srcPort
-        pkt[CPUMetadata].srcPort = CPU_PORT
-        # IP Meta
-        srcIP = pkt[IP].src
-        pkt[IP].src = pkt[IP].dst
-        pkt[IP].dst = srcIP
-        pkt[ICMP].type = ICMP_ECHO_REPLY
-        pkt[ICMP].code = ICMP_ECHO_CODE
-        pkt[ICMP].chksum = None
-        
-        self.send(pkt)
+        if pkt[IP].dst in self.swIP:
+            # Ether
+            srcEth = pkt[Ether].src
+            pkt[Ether].src = self.sw.intfs[pkt[CPUMetadata].srcPort].mac
+            pkt[Ether].dst = srcEth
+            # CPU Meta
+            pkt[CPUMetadata].fromCpu = 1
+            pkt[CPUMetadata].dstPort = pkt[CPUMetadata].srcPort
+            pkt[CPUMetadata].srcPort = CPU_PORT
+            # IP Meta
+            srcIP = pkt[IP].src
+            pkt[IP].src = pkt[IP].dst
+            pkt[IP].dst = srcIP
+            pkt[ICMP].type = ICMP_ECHO_REPLY
+            pkt[ICMP].code = ICMP_ECHO_CODE
+            pkt[ICMP].chksum = None
+            self.send(pkt)
+
+        elif pkt[IP].dst not in self.swIPs:
+            pkt[Ether].src = self.sw.intfs[pkt[CPUMetadata].srcPort].mac
+            self.send(pkt)
 
     def icmpHostUnreachable(self, pkt):
-        pkt = Ether()/CPUMetadata()/IP()/ICMP()
+        unreachPkt = Ether()/CPUMetadata()/IP()/ICMP()/Raw()
         # Ether
-        srcEth = pkt[Ether].src
-        pkt[Ether].src = self.MAC
-        pkt[Ether].dst = srcEth
+        unreachPkt[Ether].dst = pkt[Ether].src
+        print(pkt[CPUMetadata].dstPort)
+        print(pkt[CPUMetadata].srcPort)
+        unreachPkt[Ether].src = self.sw.intfs[pkt[CPUMetadata].srcPort].mac
+        unreachPkt[Ether].type = TYPE_CPU_METADATA
         # CPU Meta
-        pkt[CPUMetadata].fromCpu = 1
-        pkt[CPUMetadata].dstPort = pkt[CPUMetadata].srcPort
-        pkt[CPUMetadata].srcPort = CPU_PORT
+        unreachPkt[CPUMetadata].origEtherType = TYPE_IPV4
         # IP Meta
-        srcIP = pkt[IP].src
-        pkt[IP].src = pkt[IP].dst
-        pkt[IP].dst = srcIP
-        pkt[IP].proto = ICMP_PROTO
+        unreachPkt[IP].dst = pkt[IP].src
+        unreachPkt[IP].src = self.sw.intfs[pkt[CPUMetadata].srcPort].ip
+        unreachPkt[IP].proto = ICMP_PROTO
         # ICMP
-        pkt[ICMP].type = ICMP_HOST_UNREACHABLE
-        pkt[ICMP].code = ICMP_HOST_UNREACHABLE_CODE
-        pkt[ICMP].chksum = None
+        unreachPkt[ICMP].type = ICMP_HOST_UNREACHABLE
+        unreachPkt[ICMP].code = ICMP_HOST_UNREACHABLE_CODE
+        unreachPkt = unreachPkt / pkt[IP]
+        unreachPkt = unreachPkt / pkt[Raw]
 
-        self.send(pkt)
+        self.send(unreachPkt)
 
     def handlePkt(self, pkt):
         assert CPUMetadata in pkt, "Should only receive packets from switch with special header"
@@ -371,20 +446,15 @@ class Controller(Thread):
                 #print('ARP Reply Received')
                 self.addIPAddr(pkt[ARP].psrc, pkt[ARP].hwsrc)
                 self.addMacAddr(pkt[ARP].hwsrc, pkt[CPUMetadata].srcPort)
+                self.handleArpReply(pkt)
 
         if IP in pkt:
-            port = self.searchRoutes(pkt[IP].dst)
-                    
-            if (pkt[IP].dst not in self.ip_for_mac) and (PWOSPF not in pkt):
-                #print('pkt[IP].dst not in ARP')
-                #print('generating ARP request')
-                #print(pkt[IP].dst)
-                self.generateArpRequest(pkt[IP].dst, port)
 
-            elif ICMP in pkt:
+            if ICMP in pkt:
                 # Responding to ICMP ECHO requests
                 #print('ICMP in pkt')
                 if pkt[ICMP].type == ICMP_ECHO_REQUEST and pkt[ICMP].code == ICMP_ECHO_CODE:
+                    print('Ping Request')
                     self.icmpEcho(pkt)
             elif PWOSPF in pkt:
                 #print('PWOSPF in pkt')
@@ -397,6 +467,7 @@ class Controller(Thread):
                     # Source is identified by the source address found in the Hello's IP header
                     # We can now check/update the neighbor relationships
                     if (pkt[HELLO].mask == interface.mask) and (pkt[HELLO].helloint == interface.helloint):
+                        self.helloIPs[str(ipaddress.ip_address(pkt[PWOSPF].routerID))]={'hop':str(ipaddress.ip_address(pkt[IP].src)), 'port': pkt[CPUMetadata].srcPort}
                         if interface.knownNeighbor(pkt[PWOSPF].routerID, pkt[IP].src):
                             #print('Updated neighbor')
                             interface.addtimeNeighbor(pkt[PWOSPF].routerID, pkt[IP].src, time.time())
@@ -424,11 +495,14 @@ class Controller(Thread):
                     else:
                         # need to store adj list, time, and sequence in topology database
                         self.lsu_data[pkt[PWOSPF].routerID] = { 
+                            'routerID' : pkt[PWOSPF].routerID,
                             'adj_list' : [(x.subnet, x.mask, x.routerID) for x in pkt[LSU].Advs],
                             'time' : time.time(),
                             'sequence' : pkt[LSU].sequence
                         } 
-                    print(self.lsu_data)
+                        print('Updating topo')
+                        self.topoUpdate(self.lsu_data, self.routerID)
+                        self.addShortestPaths()
                     # if the LSU data is for a host in the database but the information
                     # has changed, the LSU is used to update the database,
                     # and Djikstra's algo is run to recompute forwarding table
@@ -437,12 +511,32 @@ class Controller(Thread):
                     # neighbors but the incoming neighbor of the packet
                     
             
-    def send(self, pkt, *args, **override_kwargs):
+    def send(self, *args, **override_kwargs):
+        pkt = args[0]
         assert CPUMetadata in pkt, "Controller must send packets with special header"
+        if IP in pkt and PWOSPF not in pkt:         
+            port, nhop_t = self.searchRoutes(pkt[IP].dst)
+            print(port)
+            nhop = None
+            if nhop_t == '0.0.0.0':
+                nhop = pkt[IP].dst
+            else:
+                nhop = nhop_t
+            
+            if port == 0:
+                self.icmpHostUnreachable(pkt)
+            elif nhop not in self.ip_for_mac:
+                print('pkt[IP].dst not in ARP')
+                #print('generating ARP request')
+                #print(pkt[IP].dst)
+                with self.pendingLock:
+                    self.pendingPacket.append([pkt, self.timeout, nhop])
+                self.generateArpRequest(pkt[IP].dst, port)
+                return
         pkt[CPUMetadata].fromCpu = 1
         kwargs = dict(iface=self.iface, verbose=False)
         kwargs.update(override_kwargs)
-        sendp(pkt, *args, **kwargs)
+        sendp(*args, **kwargs)
 
     def run(self):
         sniff(iface=self.iface, prn=self.handlePkt, stop_event=self.stop_event)

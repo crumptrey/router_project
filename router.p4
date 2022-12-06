@@ -178,8 +178,13 @@ control MyIngress(inout headers hdr,
     }
 
     action ipv4_match(ip4Addr_t dstAddr, port_t port) {
-        meta.routing.ipv4_next_hop = dstAddr;
         standard_metadata.egress_spec = port;
+        if (dstAddr != 0 ){
+            meta.routing.ipv4_next_hop = dstAddr;
+        }
+        else {
+            meta.routing.ipv4_next_hop = hdr.ipv4.dstAddr;
+        }
     }
 
     action arp_match(macAddr_t dstAddr) {
@@ -224,9 +229,11 @@ control MyIngress(inout headers hdr,
         }
         actions = {
             ipv4_match;
-            send_to_cpu;
+            NoAction;
+            drop;
         }
         size = 1024;
+        default_action = NoAction;
         // packets for which no matching entry is found in the routing table should be send to software
     }
 
@@ -236,10 +243,11 @@ control MyIngress(inout headers hdr,
             hdr.ipv4.dstAddr: exact;
         }
         actions = {
-            ipv4_match;
             send_to_cpu;
+            NoAction;
         }
         size = 64;
+        default_action = NoAction();
     }
 
 
@@ -269,7 +277,7 @@ control MyIngress(inout headers hdr,
                 if (!local_routing.apply().hit) {
                     routing_table.apply();
                 }
-                if (standard_metadata.egress_spec != CPU_PORT) {
+                if (standard_metadata.egress_spec != CPU_PORT){
                     arp_table.apply();
                 }
                 // Decrement TTL
