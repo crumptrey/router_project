@@ -273,24 +273,27 @@ control MyIngress(inout headers hdr,
             }
             else {
                 // Look up the next-hop port and IP address in the route table
-                // If it's not going to the CPU, look up MAC of next-hop
-                if (!local_routing.apply().hit) {
-                    routing_table.apply();
-                }
-                if (standard_metadata.egress_spec != CPU_PORT){
-                    arp_table.apply();
-                }
-                // Decrement TTL
-                hdr.ipv4.ttl = hdr.ipv4.ttl - 1;
                 if (hdr.ipv4.protocol == PWOSPF_PROTO){
                     pwospf_packets.count((bit<32>) 1);
                     if (standard_metadata.ingress_port != CPU_PORT) { // needed a way for received hello packets to get processed by controller
                         send_to_cpu();
                     }
                 }
-                if (hdr.ipv4.protocol == ICMP_PROTO) {
-                    icmp_packets.count((bit<32>) 1);
-                }
+                else { // If it's not going to the CPU, look up MAC of next-hop
+                  if (!local_routing.apply().hit){
+                      if (routing_table.apply().hit){
+
+                        if (!arp_table.apply().hit) {
+                            send_to_cpu();
+                        }
+                      }
+                  }
+                  // Decrement TTL
+                  hdr.ipv4.ttl = hdr.ipv4.ttl - 1;
+                  if (hdr.ipv4.protocol == ICMP_PROTO) {
+                      icmp_packets.count((bit<32>) 1);
+                  }
+              }
             }
         }
         else if (hdr.ethernet.isValid()) {

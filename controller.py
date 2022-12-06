@@ -112,8 +112,16 @@ class PWOSPFHello(Thread):
                 helloPkt[HELLO].mask = self.pwintf.mask
                 helloPkt[HELLO].helloint = self.controller.helloint
                 self.controller.send(helloPkt)
-            
+
+            for neighbor in self.pwintf.neighbor:
+                currentTime = time.time()
+                pastTime = self.pwintf.neighbor_times(neighbor[0], neighbor[1])
+                if (currentTime - pastTime) > (self.neighbor_timeout):
+                    self.pwintf.removeNeighbor(neighbor[0], neighbor[1])
+
             time.sleep(self.controller.helloint)
+
+
 
 class PWOSPFLSU(Thread):
     def __init__(self, controller):
@@ -163,6 +171,8 @@ class PWOSPFLSU(Thread):
             del ads
             time.sleep(self.controller.lsu_int) 
 
+
+
 class Controller(Thread):
     def __init__(self, sw, routerID, MAC, areaID = 1, helloint = 5, lsu_int = 30, lsu_seq = 0, start_wait=0.3):
         super(Controller, self).__init__()
@@ -180,6 +190,7 @@ class Controller(Thread):
         self.arpLock = Lock()
         self.pendingLock = Lock()
         self.port_for_mac = {}
+        self.arp_times = {}
         self.swIP = []
         self.defaultTables()
         self.routes = {}
@@ -256,6 +267,7 @@ class Controller(Thread):
                 action_name='MyIngress.arp_match',
                 action_params={'dstAddr': mac})
         self.ip_for_mac[ip] = mac
+        self.arp_times[ip] = time.time()
     #
     # *** Layer 3 ***
     #   
@@ -296,7 +308,7 @@ class Controller(Thread):
                     pkt2[IP].dst = neighbor[0]
                     if pkt2[IP].dst != pkt2[IP].src:
                         self.send(pkt2)
-                        #print('Flooding neighbors')
+                        print('Flooding neighbors')
 
     def topoUpdate(self, adj_list, sourceID):
         self.topo.clear()
@@ -330,7 +342,7 @@ class Controller(Thread):
                     nhop_ip = self.helloIPs[nhop_routerID]['hop']
                     nhop_port = self.helloIPs[nhop_routerID]['port']
                     self.addRoute(subnet, prefixLen, nhop_port, nhop_ip)
-
+                
 
     # *** ARP Functionality ***
     # * generateArpRequest: function is applied when next hop pkt[Ether].dst is not in the ARP table
@@ -357,7 +369,7 @@ class Controller(Thread):
         if pkt[ARP].pdst in self.swIP:
             to_remove = []
             with self.pendingLock:
-                for packet in self.packetPending:
+                for packet in self.pendingPacket:
                     nhop = packet[2]
                     if nhop in self.ip_for_mac:
                         to_remove.append(packet)
@@ -404,7 +416,7 @@ class Controller(Thread):
             pkt[ICMP].chksum = None
             self.send(pkt)
 
-        elif pkt[IP].dst not in self.swIPs:
+        elif pkt[IP].dst not in self.swIP:
             pkt[Ether].src = self.sw.intfs[pkt[CPUMetadata].srcPort].mac
             self.send(pkt)
 
@@ -449,7 +461,6 @@ class Controller(Thread):
                 self.handleArpReply(pkt)
 
         if IP in pkt:
-
             if ICMP in pkt:
                 # Responding to ICMP ECHO requests
                 #print('ICMP in pkt')
@@ -474,6 +485,7 @@ class Controller(Thread):
                         else:
                             #print('Added neighbor')
                             interface.addNeighbor(pkt[PWOSPF].routerID, pkt[IP].src)
+                            interface.timeNeighbor(pkt[PWOSPF].routerID, pkt[IP].src)
                     
                     else: return
 
@@ -506,7 +518,7 @@ class Controller(Thread):
                     # if the LSU data is for a host in the database but the information
                     # has changed, the LSU is used to update the database,
                     # and Djikstra's algo is run to recompute forwarding table
-                    
+                        self.LSUFlood(pkt)                    
                     # All received packets with new sequence numbers are flooded to all 
                     # neighbors but the incoming neighbor of the packet
                     
@@ -516,15 +528,16 @@ class Controller(Thread):
         assert CPUMetadata in pkt, "Controller must send packets with special header"
         if IP in pkt and PWOSPF not in pkt:         
             port, nhop_t = self.searchRoutes(pkt[IP].dst)
-            print(port)
+
             nhop = None
-            if nhop_t == '0.0.0.0':
+            if nhop_t == HOST_ID:
                 nhop = pkt[IP].dst
             else:
                 nhop = nhop_t
             
             if port == 0:
                 self.icmpHostUnreachable(pkt)
+
             elif nhop not in self.ip_for_mac:
                 print('pkt[IP].dst not in ARP')
                 #print('generating ARP request')
