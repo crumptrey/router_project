@@ -1,6 +1,11 @@
 # Internet Router Project
 ## Topology
-
+<pre>
+h1 ------- r1 ------- r2 ------- h2
+            |
+            |
+            h3
+</pre>
 ## Data-plane Requirements
 
 * -[x] Provide a routing table that can store IP address/prefix pairs with their associated port and next-hop IP address.
