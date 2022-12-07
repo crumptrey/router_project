@@ -5,7 +5,9 @@ import time
 
 topo = DemoTopo()
 net = P4Mininet(program='router.p4', topo=topo, auto_arp=False)
+
 net.start()
+
 s1 = net.get('s1')
 s2 = net.get('s2')
 h1 = net.get('h1')
@@ -89,6 +91,7 @@ CLI(net)
 
 # These table entries were added by the CPU:
 s1.printTableEntries()
+s2.printTableEntries()
 # Counters
 print('-----------------')
 print('Router 1 Counters:')
