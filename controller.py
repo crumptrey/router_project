@@ -561,7 +561,7 @@ class Controller(Thread):
                 with self.pendingLock:
                     print('Queueing packet')
                     self.pendingPacket.append([pkt, self.timeout, nhop])
-                self.generateArpRequest(pkt[IP].dst, port)
+                self.generateArpRequest(nhop, port)
                 return
         pkt[CPUMetadata].fromCpu = 1
         kwargs = dict(iface=self.iface, verbose=False)
